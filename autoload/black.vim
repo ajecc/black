@@ -1,243 +1,148 @@
 python3 << EndPython3
 import collections
-import os
 import sys
+import traceback
+from distutils.util import strtobool
+from pathlib import Path
+from typing import List, Tuple
+
 import vim
 
-def strtobool(text):
-  if text.lower() in ['y', 'yes', 't', 'true', 'on', '1']:
-    return True
-  if text.lower() in ['n', 'no', 'f', 'false', 'off', '0']:
-    return False
-  raise ValueError(f"{text} is not convertible to boolean")
 
 class Flag(collections.namedtuple("FlagBase", "name, cast")):
-  @property
-  def var_name(self):
-    return self.name.replace("-", "_")
+    @property
+    def var_name(self) -> str:
+        return self.name.replace("-", "_")
 
-  @property
-  def vim_rc_name(self):
-    name = self.var_name
-    if name == "line_length":
-      name = name.replace("_", "")
-    return "g:black_" + name
+    @property
+    def vim_rc_name(self) -> str:
+        name = self.var_name
+        if name == "line_length":
+            name = name.replace("_", "")
+        return "g:black_" + name
 
 
 FLAGS = [
-  Flag(name="line_length", cast=int),
-  Flag(name="fast", cast=strtobool),
-  Flag(name="skip_string_normalization", cast=strtobool),
-  Flag(name="quiet", cast=strtobool),
-  Flag(name="skip_magic_trailing_comma", cast=strtobool),
-  Flag(name="preview", cast=strtobool),
+    Flag(name="line_length", cast=int),
+    Flag(name="fast", cast=strtobool),
+    Flag(name="string_normalization", cast=strtobool),
 ]
 
 
-def _get_python_binary(exec_prefix, pyver):
-  try:
-    default = vim.eval("g:pymode_python").strip()
-  except vim.error:
-    default = ""
-  if default and os.path.exists(default):
-    return default
-  if sys.platform[:3] == "win":
-    return exec_prefix / 'python.exe'
-  bin_path = exec_prefix / "bin"
-  exec_path = (bin_path / f"python{pyver[0]}.{pyver[1]}").resolve()
-  if exec_path.exists():
-    return exec_path
-  # It is possible that some environments may only have python3
-  exec_path = (bin_path / f"python3").resolve()
-  if exec_path.exists():
-    return exec_path
-  raise ValueError("python executable not found")
-
-def _get_pip(venv_path):
-  if sys.platform[:3] == "win":
-    return venv_path / 'Scripts' / 'pip.exe'
-  return venv_path / 'bin' / 'pip'
-
 def _get_virtualenv_site_packages(venv_path, pyver):
-  if sys.platform[:3] == "win":
-    return venv_path / 'Lib' / 'site-packages'
-  return venv_path / 'lib' / f'python{pyver[0]}.{pyver[1]}' / 'site-packages'
+    if sys.platform[:3] == "win":
+        return venv_path / "Lib" / "site-packages"
+    return venv_path / "lib" / f"python{pyver[0]}.{pyver[1]}" / "site-packages"
 
-def _initialize_black_env(upgrade=False):
-  if vim.eval("g:black_use_virtualenv ? 'true' : 'false'") == "false":
-    if upgrade:
-      print("Upgrade disabled due to g:black_use_virtualenv being disabled.")
-      print("Either use your system package manager (or pip) to upgrade black separately,")
-      print("or modify your vimrc to have 'let g:black_use_virtualenv = 1'.")
-      return False
-    else:
-      # Nothing needed to be done.
-      return True
 
-  pyver = sys.version_info[:3]
-  if pyver < (3, 8):
-    print("Sorry, Black requires Python 3.8+ to run.")
-    return False
+def _initialize_black_env() -> None:
+    pyver = sys.version_info[:2]
+    if pyver < (3, 6):
+        print("Sorry, Black requires Python 3.6+ to run.")
+        return
 
-  from pathlib import Path
-  import subprocess
-  import venv
-  virtualenv_path = Path(vim.eval("g:black_virtualenv")).expanduser()
-  virtualenv_site_packages = str(_get_virtualenv_site_packages(virtualenv_path, pyver))
-  first_install = False
-  if not virtualenv_path.is_dir():
-    print('Please wait, one time setup for Black.')
-    _executable = sys.executable
-    _base_executable = getattr(sys, "_base_executable", _executable)
-    try:
-      executable = str(_get_python_binary(Path(sys.exec_prefix), pyver))
-      sys.executable = executable
-      sys._base_executable = executable
-      print(f'Creating a virtualenv in {virtualenv_path}...')
-      print('(this path can be customized in .vimrc by setting g:black_virtualenv)')
-      venv.create(virtualenv_path, with_pip=True)
-    except Exception:
-      print('Encountered exception while creating virtualenv (see traceback below).')
-      print(f'Removing {virtualenv_path}...')
-      import shutil
-      shutil.rmtree(virtualenv_path)
-      raise
-    finally:
-      sys.executable = _executable
-      sys._base_executable = _base_executable
-    first_install = True
-  if first_install:
-    print('Installing Black with pip...')
-  if upgrade:
-    print('Upgrading Black with pip...')
-  if first_install or upgrade:
-    subprocess.run([str(_get_pip(virtualenv_path)), 'install', '-U', 'black'], stdout=subprocess.PIPE)
-    print('DONE! You are all set, thanks for waiting ✨ 🍰 ✨')
-  if first_install:
-    print('Pro-tip: to upgrade Black in the future, use the :BlackUpgrade command and restart Vim.\n')
-  if virtualenv_site_packages not in sys.path:
-    sys.path.insert(0, virtualenv_site_packages)
-  return True
-
-if _initialize_black_env():
-  import black
-  import time
-
-def get_target_version(tv):
-  if isinstance(tv, black.TargetVersion):
-    return tv
-  ret = None
-  try:
-    ret = black.TargetVersion[tv.upper()]
-  except KeyError:
-    print(f"WARNING: Target version {tv!r} not recognized by Black, using default target")
-  return ret
-
-def Black(**kwargs):
-  """
-  kwargs allows you to override ``target_versions`` argument of
-  ``black.FileMode``.
-
-  ``target_version`` needs to be cleaned because ``black.FileMode``
-  expects the ``target_versions`` argument to be a set of TargetVersion enums.
-
-  Allow kwargs["target_version"] to be a string to allow
-  to type it more quickly.
-
-  Using also target_version instead of target_versions to remain
-  consistent to Black's documentation of the structure of pyproject.toml.
-  """
-  start = time.time()
-  configs = get_configs()
-
-  black_kwargs = {}
-  if "target_version" in kwargs:
-    target_version = kwargs["target_version"]
-
-    if not isinstance(target_version, (list, set)):
-      target_version = [target_version]
-    target_version = set(filter(lambda x: x, map(lambda tv: get_target_version(tv), target_version)))
-    black_kwargs["target_versions"] = target_version
-
-  mode = black.FileMode(
-    line_length=configs["line_length"],
-    string_normalization=not configs["skip_string_normalization"],
-    is_pyi=vim.current.buffer.name.endswith('.pyi'),
-    magic_trailing_comma=not configs["skip_magic_trailing_comma"],
-    preview=configs["preview"],
-    **black_kwargs,
-  )
-  quiet = configs["quiet"]
-
-  buffer_str = '\n'.join(vim.current.buffer) + '\n'
-  try:
-    new_buffer_str = black.format_file_contents(
-      buffer_str,
-      fast=configs["fast"],
-      mode=mode,
+    virtualenv_path = Path(vim.eval("g:black_virtualenv")).expanduser()
+    if not virtualenv_path.is_dir():
+        print("Virtual environment: {} does not exist".format(virtualenv_path))
+        return
+    virtualenv_site_packages = str(
+        _get_virtualenv_site_packages(virtualenv_path, pyver)
     )
-  except black.NothingChanged:
-    if not quiet:
-      print(f'Black: already well formatted, good job. (took {time.time() - start:.4f}s)')
-  except Exception as exc:
-    print(f'Black: {exc}')
-  else:
-    current_buffer = vim.current.window.buffer
-    cursors = []
-    for i, tabpage in enumerate(vim.tabpages):
-      if tabpage.valid:
-        for j, window in enumerate(tabpage.windows):
-          if window.valid and window.buffer == current_buffer:
-            cursors.append((i, j, window.cursor))
-    vim.current.buffer[:] = new_buffer_str.split('\n')[:-1]
-    for i, j, cursor in cursors:
-      window = vim.tabpages[i].windows[j]
-      try:
-        window.cursor = cursor
-      except vim.error:
-        window.cursor = (len(window.buffer), 0)
-    if not quiet:
-      print(f'Black: reformatted in {time.time() - start:.4f}s.')
-
-def get_configs():
-  filename = vim.eval("@%")
-  path_pyproject_toml = black.find_pyproject_toml((filename,))
-  if path_pyproject_toml:
-    toml_config = black.parse_pyproject_toml(path_pyproject_toml)
-  else:
-    toml_config = {}
-
-  return {
-    flag.var_name: toml_config.get(flag.name, flag.cast(vim.eval(flag.vim_rc_name)))
-    for flag in FLAGS
-  }
+    if virtualenv_site_packages not in sys.path:
+        sys.path.insert(0, virtualenv_site_packages)
 
 
-def BlackUpgrade():
-  _initialize_black_env(upgrade=True)
+_initialize_black_env()
+import black
+
+
+def _get_indent(line: str) -> str:
+    indent = ""
+    for char in line:
+        if not char.isspace():
+            break
+        indent += char
+    return indent
+
+
+def _indent_split(lines: List[str]) -> Tuple[str, List[str]]:
+    indent = _get_indent(lines[0])
+    return indent, [line.replace(indent, "", 1) for line in lines]
+
+
+def _add_indent(line: str, indent: str) -> str:
+    if not line:
+        return line
+    return indent + line
+
+
+def _get_configs() -> dict:
+    path_pyproject_toml = black.find_pyproject_toml(
+        (vim.eval("expand('%:p:h')"),)
+    )
+    if path_pyproject_toml:
+        toml_config = black.parse_pyproject_toml(path_pyproject_toml)
+    else:
+        toml_config = {}
+
+    return {
+        flag.var_name: flag.cast(toml_config.get(flag.name, vim.eval(flag.vim_rc_name)))
+        for flag in FLAGS
+    }
+
+
+def Black(from_line: int, to_line: int) -> None:
+    configs = _get_configs()
+    mode = black.Mode(
+        line_length=configs["line_length"],
+        string_normalization=configs["string_normalization"],
+        is_pyi=vim.current.buffer.name.endswith(".pyi"),
+    )
+    lines_to_format = vim.current.buffer[from_line:to_line]
+    indent, lines_to_format = _indent_split(lines_to_format)
+    mode.line_length -= len(indent)
+    try:
+        new_buffer_str = black.format_file_contents(
+            "\n".join(lines_to_format),
+            fast=configs["fast"],
+            mode=mode,
+        )
+    except black.NothingChanged:
+        print("Already well formatted, good job!")
+    except Exception:
+        traceback.print_exception(*sys.exc_info())
+    else:
+        current_buffer = vim.current.window.buffer
+        cursors = []
+        for i, tabpage in enumerate(vim.tabpages):
+            if tabpage.valid:
+                for j, window in enumerate(tabpage.windows):
+                    if window.valid and window.buffer == current_buffer:
+                        cursors.append((i, j, window.cursor))
+        vim.current.buffer[from_line:to_line] = [
+            _add_indent(line, indent) for line in new_buffer_str.split("\n")[:-1]
+        ]
+        for i, j, cursor in cursors:
+            window = vim.tabpages[i].windows[j]
+            try:
+                window.cursor = cursor
+            except vim.error:
+                window.cursor = (len(window.buffer), 0)
+        print("Finished formatting, yay!")
+
 
 def BlackVersion():
-  print(f'Black, version {black.__version__} on Python {sys.version}.')
+    print(f"Black, version {black.__version__} on Python {sys.version}.")
+
 
 EndPython3
 
-function black#Black(...)
-    let kwargs = {}
-    for arg in a:000
-        let arg_list = split(arg, '=')
-        let kwargs[arg_list[0]] = arg_list[1]
-    endfor
-python3 << EOF
-import vim
-kwargs = vim.eval("kwargs")
-EOF
-  :py3 Black(**kwargs)
+
+function black#Black(from_line, to_line)
+    execute "py3 Black(" . (a:from_line - 1) . ", " . a:to_line . ")"
 endfunction
 
-function black#BlackUpgrade()
-  :py3 BlackUpgrade()
-endfunction
 
 function black#BlackVersion()
-  :py3 BlackVersion()
+    py3 BlackVersion()
 endfunction
